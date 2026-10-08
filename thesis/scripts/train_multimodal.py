@@ -1,0 +1,240 @@
+import os
+import sys
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score, classification_report
+from tqdm import tqdm
+
+sys.path.append('/data8/luoyan/Kamal/thesis')
+from data.meld_dataset import get_dataloaders, EMOTION2ID, SENTIMENT2ID
+from models.multimodal_model import MultimodalEmotionModel
+
+# ── Config ─────────────────────────────────────────────────────
+DEVICE          = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+EPOCHS          = 15          # more epochs since we freeze first
+BATCH_SIZE      = 8
+LR              = 2e-5
+MAX_LEN         = 128
+CONTEXT_WINDOW  = 3           # previous utterances for context
+UNFREEZE_EPOCH  = 4           # epoch at which BERT gets unfrozen
+SAVE_DIR        = '/data8/luoyan/Kamal/thesis/outputs'
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ── Class Weights (handle imbalance) ───────────────────────────
+EMOTION_COUNTS  = [4710, 1743, 1205, 1109, 683, 271, 268]
+EMOTION_WEIGHTS = torch.tensor(
+    [1.0 / c for c in EMOTION_COUNTS], dtype=torch.float32
+)
+EMOTION_WEIGHTS = EMOTION_WEIGHTS / EMOTION_WEIGHTS.sum()
+
+ID2EMOTION   = {v: k for k, v in EMOTION2ID.items()}
+ID2SENTIMENT = {v: k for k, v in SENTIMENT2ID.items()}
+
+
+# ── Optimizer Builder ──────────────────────────────────────────
+def build_optimizer(model, bert_lr=5e-6, other_lr=2e-5):
+    """Separate LR for BERT vs rest of model."""
+    bert_params  = list(model.text_encoder.parameters())
+    other_params = [p for n, p in model.named_parameters()
+                    if 'text_encoder' not in n]
+    return AdamW([
+        {'params': bert_params,  'lr': bert_lr},
+        {'params': other_params, 'lr': other_lr},
+    ], weight_decay=0.01)
+
+
+# ── Train One Epoch ────────────────────────────────────────────
+def train_epoch(model, loader, optimizer, scheduler,
+                emo_criterion, sent_criterion):
+    model.train()
+    total_loss = 0
+    all_preds, all_labels = [], []
+
+    for batch in tqdm(loader, desc='Training'):
+        input_ids      = batch['input_ids'].to(DEVICE)
+        attention_mask = batch['attention_mask'].to(DEVICE)
+        waveform       = batch['waveform'].to(DEVICE).float()
+        speaker_ids    = batch['speaker_id'].to(DEVICE)
+        emo_labels     = batch['emotion_label'].to(DEVICE)
+        sent_labels    = batch['sentiment_label'].to(DEVICE)
+
+        optimizer.zero_grad()
+        emo_logits, sent_logits = model(
+            input_ids, attention_mask, waveform, speaker_ids
+        )
+
+        emo_loss  = emo_criterion(emo_logits, emo_labels)
+        sent_loss = sent_criterion(sent_logits, sent_labels)
+        loss = emo_loss + 0.3 * sent_loss   # reduced sentiment weight
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+        preds = torch.argmax(emo_logits, dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(emo_labels.cpu().numpy())
+
+    avg_loss = total_loss / len(loader)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    return avg_loss, f1
+
+
+# ── Evaluate ───────────────────────────────────────────────────
+def evaluate(model, loader, emo_criterion, sent_criterion, split='Val'):
+    model.eval()
+    total_loss = 0
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=f'Evaluating {split}'):
+            input_ids      = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            waveform       = batch['waveform'].to(DEVICE).float()
+            speaker_ids    = batch['speaker_id'].to(DEVICE)
+            emo_labels     = batch['emotion_label'].to(DEVICE)
+            sent_labels    = batch['sentiment_label'].to(DEVICE)
+
+            emo_logits, sent_logits = model(
+                input_ids, attention_mask, waveform, speaker_ids
+            )
+            emo_loss  = emo_criterion(emo_logits, emo_labels)
+            sent_loss = sent_criterion(sent_logits, sent_labels)
+            loss = emo_loss + 0.3 * sent_loss
+
+            total_loss += loss.item()
+            preds = torch.argmax(emo_logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(emo_labels.cpu().numpy())
+
+    avg_loss = total_loss / len(loader)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+
+    if split == 'Test':
+        labels      = list(ID2EMOTION.keys())
+        label_names = [ID2EMOTION[i] for i in labels]
+        print("\n" + classification_report(
+            all_labels, all_preds,
+            labels=labels, target_names=label_names,
+            zero_division=0
+        ))
+
+    return avg_loss, f1
+
+
+# ── Main ───────────────────────────────────────────────────────
+def main():
+    print(f"Device: {DEVICE}")
+    print(f"Context window: {CONTEXT_WINDOW} previous utterances")
+    print("Loading data...")
+
+    train_loader, dev_loader, test_loader = get_dataloaders(
+        batch_size=BATCH_SIZE,
+        max_text_len=MAX_LEN,
+        context_window=CONTEXT_WINDOW,
+    )
+
+    print("\nBuilding multimodal model with speaker embedding...")
+    torch.cuda.empty_cache()
+    model = MultimodalEmotionModel(
+        num_emotions=7,
+        num_sentiments=3,
+        hidden_size=768,
+        speaker_emb_dim=64,
+        num_speakers=7,
+        dropout=0.3,
+        freeze_text=True        # freeze BERT for first 3 epochs
+    ).to(DEVICE)
+    model = model.float()
+
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal parameters    : {total:,}")
+    print(f"Trainable parameters: {trainable:,}")
+
+    # ── loss functions ─────────────────────────────────────────
+    emo_weights    = EMOTION_WEIGHTS.to(DEVICE)
+    emo_criterion  = nn.CrossEntropyLoss(weight=emo_weights)
+    sent_criterion = nn.CrossEntropyLoss()
+
+    # ── initial optimizer (BERT frozen) ───────────────────────
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=LR, weight_decay=0.01
+    )
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=total_steps // 10,
+        num_training_steps=total_steps
+    )
+
+    print(f"\nStarting training for {EPOCHS} epochs...")
+    print(f"BERT unfreezes at epoch {UNFREEZE_EPOCH}\n")
+
+    best_val_f1 = 0
+    best_path   = os.path.join(SAVE_DIR, 'best_multimodal_model.pt')
+
+    for epoch in range(1, EPOCHS + 1):
+        print(f"\n{'='*55}")
+        print(f"Epoch {epoch}/{EPOCHS}")
+        print(f"{'='*55}")
+
+        # ── gradual unfreeze at epoch 4 ────────────────────────
+        if epoch == UNFREEZE_EPOCH:
+            print("🔓 Unfreezing BERT text encoder with lower LR (5e-6)...")
+            for param in model.text_encoder.parameters():
+                param.requires_grad = True
+
+            # rebuild optimizer with separate LRs
+            optimizer = build_optimizer(model, bert_lr=5e-6, other_lr=2e-5)
+            # rebuild scheduler for remaining epochs
+            remaining_steps = len(train_loader) * (EPOCHS - epoch + 1)
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=remaining_steps // 10,
+                num_training_steps=remaining_steps
+            )
+            trainable = sum(p.numel() for p in model.parameters()
+                            if p.requires_grad)
+            print(f"   Trainable parameters now: {trainable:,}")
+
+        # ── train & evaluate ───────────────────────────────────
+        train_loss, train_f1 = train_epoch(
+            model, train_loader, optimizer, scheduler,
+            emo_criterion, sent_criterion
+        )
+        val_loss, val_f1 = evaluate(
+            model, dev_loader, emo_criterion, sent_criterion, 'Val'
+        )
+
+        print(f"\nTrain Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
+        print(f"Val   Loss: {val_loss:.4f} | Val   F1: {val_f1:.4f}")
+
+        # ── save best ──────────────────────────────────────────
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), best_path)
+            print(f"✅ Best model saved! Val F1: {val_f1:.4f}")
+
+    # ── final test ─────────────────────────────────────────────
+    print(f"\n{'='*55}")
+    print("Final Test Evaluation")
+    print(f"{'='*55}")
+    model.load_state_dict(torch.load(best_path, weights_only=True))
+    test_loss, test_f1 = evaluate(
+        model, test_loader, emo_criterion, sent_criterion, 'Test'
+    )
+    print(f"Test Loss: {test_loss:.4f} | Test F1: {test_f1:.4f}")
+    print(f"\n🎉 Training complete! Best Val F1: {best_val_f1:.4f}")
+    print(f"\n📊 Summary:")
+    print(f"   Text + Audio + Speaker + Context")
+    print(f"   Test F1: {test_f1:.4f}")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+thesis/data/
+thesis/models/*.pt
+thesis/models/*.pth
+thesis/models/*.ckpt
+thesis/logs/
+thesis/outputs/

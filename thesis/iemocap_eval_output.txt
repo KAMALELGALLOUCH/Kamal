@@ -1,0 +1,38 @@
+
+============================================================
+  Evaluating: T+A+Speaker+Context
+  Checkpoint: /data8/luoyan/Kamal/thesis/outputs/iemocap/best_iemocap_model.pt
+  Device    : cuda
+============================================================
+
+Loading test data...
+Train sessions: [1, 2, 3, 4]
+Test session  : [5]
+Use MOCAP     : False
+[train] 5183 samples
+[dev]   575 samples
+[test]  1622 samples
+Test batches: 102
+Loading model...
+Running inference on test set...
+
+============================================================
+  T+A+Speaker+Context
+  Weighted F1: 0.7085
+============================================================
+              precision    recall  f1-score   support
+
+     neutral       0.65      0.65      0.65       384
+       happy       0.88      0.80      0.84       442
+     sadness       0.72      0.78      0.75       245
+       anger       0.60      0.73      0.66       170
+  frustrated       0.63      0.60      0.62       381
+
+    accuracy                           0.71      1622
+   macro avg       0.70      0.71      0.70      1622
+weighted avg       0.71      0.71      0.71      1622
+
+  Confusion matrix saved → /data8/luoyan/Kamal/thesis/outputs/figures/iemocap_confusion_matrix_base.png
+  Per-class F1 chart saved → /data8/luoyan/Kamal/thesis/outputs/figures/iemocap_per_class_f1_base.png
+
+✅ Evaluation complete — Weighted F1: 0.7085
